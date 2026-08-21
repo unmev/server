@@ -29,6 +29,7 @@ LOG_TMPFS_SIZE="${LOG_TMPFS_SIZE:-8m}"
 SYSLOG_FILE_KB="${SYSLOG_FILE_KB:-128}"
 SYSLOG_BACKUPS="${SYSLOG_BACKUPS:-2}"
 AUTO_REBOOT="${AUTO_REBOOT:-yes}"
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-128}"
 
 # Compatibility packages for common node installation scripts.
 # BusyBox already provides wget, vi, tar, gzip, unzip, ip, ping, sed and awk.
@@ -261,6 +262,16 @@ ClientAliveInterval 300
 ClientAliveCountMax 2
 LogLevel INFO
 EOF
+# Patch the main sshd_config directly too, so root login and password auth
+# work even if an older OpenSSH ignores the sshd_config.d Include above.
+sed -i \
+    -e 's/^#PermitRootLogin.*/PermitRootLogin yes/' \
+    -e 's/^PermitRootLogin.*/PermitRootLogin yes/' \
+    -e 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' \
+    -e 's/^PasswordAuthentication.*/PasswordAuthentication yes/' \
+    /mnt/etc/ssh/sshd_config
+grep -q '^PermitRootLogin' /mnt/etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /mnt/etc/ssh/sshd_config
+grep -q '^PasswordAuthentication' /mnt/etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /mnt/etc/ssh/sshd_config
 chroot /mnt ssh-keygen -A >/dev/null 2>&1 || true
 chroot /mnt /usr/sbin/sshd -t
 chroot /mnt rc-update add sshd default >/dev/null 2>&1 || true
@@ -309,9 +320,59 @@ ulimit -c 0 2>/dev/null || true
 EOF
 chmod 644 /mnt/etc/profile.d/no-coredump.sh
 
-# Raise file descriptor allowance for proxy/node daemons started by OpenRC.
-if ! grep -q '^rc_ulimit=' /mnt/etc/rc.conf 2>/dev/null; then
+# Dynamic login banner for SSH sessions. No public-IP lookup, so login stays fast.
+cat > /mnt/etc/profile.d/motd.sh <<'EOF'
+#!/bin/sh
+_cpu="$(grep -m1 -i 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^[[:space:]]*//')"
+[ -n "$_cpu" ] || _cpu="$(uname -m)"
+
+echo "=================================="
+echo "        Alpine Tiny Server"
+echo
+echo "Hostname:    $(hostname)"
+echo "Alpine版本:  $(cat /etc/alpine-release 2>/dev/null)"
+echo "Kernel:      $(uname -r)"
+echo
+echo "CPU:         $_cpu ($(grep -c '^processor' /proc/cpuinfo 2>/dev/null) cores)"
+echo "Memory:      $(free -m | awk '/^Mem:/ {print $3" MiB used / "$2" MiB total"}')"
+echo "Swap:        $(free -m | awk '/^Swap:/ {if ($2 == 0) print "disabled"; else print $3" MiB used / "$2" MiB total"}')"
+echo "Disk:        $(df -h / | awk 'NR==2 {print $3" used / "$2" total ("$5")"}')"
+echo
+echo "Uptime:      $(uptime | sed 's/.*up  *\([^,]*\),.*/\1/')"
+echo
+echo "=================================="
+EOF
+chmod 644 /mnt/etc/profile.d/motd.sh
+
+# Raise file descriptor allowance for proxy/node/frp/docker daemons via OpenRC.
+# rc.conf ships with rc_ulimit="" by default, so replace (or add) it in place.
+if grep -q '^rc_ulimit=' /mnt/etc/rc.conf 2>/dev/null; then
+    sed -i 's/^rc_ulimit=.*/rc_ulimit="-n 65535"/' /mnt/etc/rc.conf
+else
     printf '\nrc_ulimit="-n 65535"\n' >> /mnt/etc/rc.conf
+fi
+
+say 'Creating swap file'
+SWAP_OK=no
+if [ -e /mnt/swapfile ]; then
+    say 'Swap file already exists; skipping creation'
+    SWAP_OK=yes
+elif dd if=/dev/zero of=/mnt/swapfile bs=1M count="$SWAP_SIZE_MB" 2>/dev/null; then
+    chmod 600 /mnt/swapfile
+    if mkswap /mnt/swapfile >/dev/null 2>&1; then
+        SWAP_OK=yes
+    else
+        warn 'mkswap failed; removing incomplete swap file'
+        rm -f /mnt/swapfile
+    fi
+else
+    warn 'Failed to allocate swap file; continuing without swap'
+fi
+if [ "$SWAP_OK" = yes ]; then
+    grep -q '^/swapfile[[:space:]]' /mnt/etc/fstab ||
+        printf '/swapfile\tnone\tswap\tsw\t0\t0\n' >> /mnt/etc/fstab
+    chroot /mnt swapon /swapfile 2>/dev/null || warn 'swapon failed now; swap will activate on boot if supported'
+    chroot /mnt rc-update add swap boot >/dev/null 2>&1 || true
 fi
 
 say 'Installing automatic cache cleanup and disk guard'
@@ -364,6 +425,24 @@ fi
 sync
 say 'Final disk usage'
 df -h /mnt || true
+
+say 'Verification summary'
+printf 'SSH root login : '
+if grep -q '^PermitRootLogin yes$' /mnt/etc/ssh/sshd_config 2>/dev/null || \
+   grep -q '^PermitRootLogin yes$' /mnt/etc/ssh/sshd_config.d/00-node.conf 2>/dev/null; then
+    printf 'enabled\n'
+else
+    printf 'NOT enabled\n'
+fi
+printf 'Swap           : '
+if grep -q '^/swapfile[[:space:]]' /mnt/etc/fstab 2>/dev/null; then
+    printf 'configured (/swapfile %s MiB)\n' "$SWAP_SIZE_MB"
+else
+    printf 'none\n'
+fi
+printf 'Disk           : '
+df -h /mnt 2>/dev/null | awk 'NR==2 {print $3" used / "$2" total ("$5" used)"}'
+
 printf '\nInstalled root partition: %s\n' "$ROOT_PART"
 printf 'SSH login: root@SERVER_IP port %s\n' "$SSH_PORT"
 printf 'After shutdown, detach the ISO and boot from %s.\n' "$DISK"
